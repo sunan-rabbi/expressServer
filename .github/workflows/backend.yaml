@@ -44,59 +44,6 @@ jobs:
         run: |
           ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "echo 'SSH connection successful'"
 
-      - name: Install Prerequisites
-        run: |
-          ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'ENDSSH'
-            set -e
-
-            REPO='${{ secrets.REPO }}'
-            BOOTSTRAP_MARKER="$HOME/.${REPO}_bootstrap_done"
-
-            if [ ! -f "$BOOTSTRAP_MARKER" ]; then
-              echo "First deployment bootstrap started"
-
-              sudo apt update && sudo apt upgrade -y
-
-              # System-wide fallback for non-NVM shells.
-              sudo apt install -y nodejs npm git curl
-
-              if [ ! -d "$HOME/.nvm" ]; then
-                curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
-              fi
-
-              export NVM_DIR="$HOME/.nvm"
-              [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
-
-              nvm install '${{ env.NODE_VERSION }}'
-              nvm use '${{ env.NODE_VERSION }}'
-              nvm alias default '${{ env.NODE_VERSION }}'
-
-              npm install -g pm2
-
-              touch "$BOOTSTRAP_MARKER"
-              echo "Bootstrap completed"
-            else
-              echo "Bootstrap already completed"
-            fi
-
-            export NVM_DIR="$HOME/.nvm"
-            [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
-            nvm use '${{ env.NODE_VERSION }}' || true
-
-            if ! command -v npm >/dev/null 2>&1; then
-              sudo apt update
-              sudo apt install -y nodejs npm
-            fi
-
-            if ! command -v pm2 >/dev/null 2>&1; then
-              npm install -g pm2
-            fi
-
-            echo "Node: $(node -v)"
-            echo "NPM: $(npm -v)"
-            echo "PM2: $(pm2 -v)"
-          ENDSSH
-
       - name: Setup PostgreSQL
         run: |
           ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'ENDSSH'
@@ -206,31 +153,7 @@ jobs:
             nvm use '${{ env.NODE_VERSION }}' || true
 
             pm2 delete server || true
-            pm2 start "$DEPLOY_PATH/dist/server.js" --name server
+            pm2 start "$DEPLOY_PATH/dist/server.js" --name server --cwd "$DEPLOY_PATH"
             pm2 save
             pm2 status
-          ENDSSH
-
-      - name: Health Check
-        if: github.event.inputs.skip_health_check != 'true'
-        run: |
-          ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'ENDSSH'
-            set -e
-
-            REPO='${{ secrets.REPO }}'
-            DEPLOY_PATH="$HOME/${REPO}"
-
-            cd "$DEPLOY_PATH"
-            PORT="${{ secrets.PORT }}"
-            [ -n "$PORT" ] || PORT="5000"
-
-            sleep 5
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:${PORT}/health" || true)
-            if [ "$CODE" != "200" ]; then
-              echo "Health check failed with HTTP ${CODE}"
-              pm2 logs server --lines 30 --nostream || true
-              exit 1
-            fi
-
-            echo "Health check passed with HTTP ${CODE}"
           ENDSSH
