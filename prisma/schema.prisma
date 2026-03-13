@@ -1,0 +1,115 @@
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id        String     @id @default(uuid())
+  email     String     @unique
+  phone     String     @unique
+  password  String
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+  status    UserStatus @default(ACTIVE)
+  role      UserRole
+
+  //Relations
+  admins          Admin[]
+  activeTokens    ActiveToken[]
+  tokenBlacklists TokenBlacklist[]
+
+  @@map("users")
+}
+
+model Admin {
+  id        String  @id @default(uuid())
+  name      String
+  email     String  @unique
+  phone     String  @unique
+  isDeleted Boolean @default(false)
+
+  //Relations
+  userId String
+  user   User   @relation(fields: [userId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("admins")
+}
+
+// 🔍 System & Security
+model ActiveToken {
+  id         String    @id @default(uuid())
+  tokenId    String    @unique
+  userId     String
+  ipAddress  String?
+  deviceInfo Json?
+  lastUsed   DateTime  @default(now())
+  expiresAt  DateTime
+  createdAt  DateTime  @default(now())
+  tokenType  TokenType
+  user       User      @relation(fields: [userId], references: [id])
+
+  @@map("active_token")
+}
+
+model TokenBlacklist {
+  id            String    @id @default(uuid())
+  tokenId       String    @unique
+  tokenType     TokenType
+  userId        String?
+  issuedAt      DateTime
+  expiresAt     DateTime
+  blacklistedAt DateTime  @default(now())
+  reason        String?
+  ipAddress     String?
+  user          User?     @relation(fields: [userId], references: [id])
+
+  @@map("black_token")
+}
+
+// Enums for AuditLog
+enum TokenType {
+  ACCESS
+  REFRESH
+}
+
+enum AuditAction {
+  // CRUD Operations
+  CREATE
+  READ
+  UPDATE
+  DELETE
+
+  // Authentication
+  LOGIN
+  LOGOUT
+  LOGIN_FAILED
+  PASSWORD_CHANGE
+  PASSWORD_RESET
+}
+
+enum AuditStatus {
+  SUCCESS
+  FAILED
+  PENDING
+  CANCELLED
+}
+
+enum UserRole {
+  SUPER_ADMIN
+  ADMIN
+}
+
+enum UserStatus {
+  BLOCKED
+  ACTIVE
+  PENDING
+  DELETED
+}

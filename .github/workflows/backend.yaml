@@ -1,0 +1,130 @@
+name: Deploy the Backend
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy the Backend
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Prepare Server Environment
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{secrets.EC2_HOST}}
+          username: ${{secrets.EC2_USER}}
+          key: ${{secrets.EC2_SSH_KEY}}
+          script: |
+            set -e
+
+            DB_USER=${{ secrets.DB_USER }}
+            DB_PASS=${{ secrets.DB_PASSWORD }}
+            DB_NAME=${{ secrets.DB_NAME }}
+            REPO=${{ secrets.REPO }}
+
+            # Update System Packages
+            echo " Update and Upgrade the function"
+            sudo apt update && sudo apt upgrade -y
+
+            # Install NVM
+            if [ ! -d "$HOME/.nvm" ]; then
+              curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
+            fi
+
+            export NVM_DIR="$HOME/.nvm"
+            [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+
+            # Install Node.js LTS
+            echo " Install Node.js LTS"
+            nvm install --lts
+            nvm use --lts
+
+            # Verify Installation
+            echo "Verify Installation"
+            node -v
+            npm -v
+
+            # Install PM2 globally
+            echo "Install PM2 globally"
+            npm install -g pm2
+
+            # Install PostgreSQL
+            echo "Install PostgreSQL"
+            sudo apt install -y postgresql postgresql-contrib
+            sudo systemctl start postgresql
+            sudo systemctl enable postgresql
+
+            # Create Database & User
+            echo "Create Database & User"
+            sudo systemctl start postgresql
+
+            sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'" | grep -q 1 || \
+            sudo -u postgres psql -c "CREATE USER \"${DB_USER}\" WITH PASSWORD '${DB_PASS}';"
+
+            # Grant CREATEDB privilege for Prisma Migrate shadow database
+            sudo -u postgres psql -c "ALTER USER \"${DB_USER}\" CREATEDB;"
+
+            sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" | grep -q 1 || \
+            sudo -u postgres psql -c "CREATE DATABASE \"${DB_NAME}\" OWNER \"${DB_USER}\";"
+
+            # Clone or Update Repository
+            echo "Clone or Update Repository"
+            if [ ! -d "$HOME/${REPO}" ]; then
+              cd ~
+              git clone https://github.com/sunan-rabbi/${REPO}.git
+            else
+              cd $HOME/${REPO}
+              git fetch origin
+              git reset --hard origin/master
+            fi
+            cd $HOME/${REPO}
+
+            # Setup Backend
+            echo "Setup Backend"
+            cd ~/${REPO}/backend
+            npm install
+
+            # Create Production Environment File
+            echo "Environment File"
+            sudo cp .env.example .env
+
+            # Setup Prisma
+            echo "Setup Prisma"
+            npm run genKey
+            npm run migrate
+            npm run generate
+
+            # Build the File
+            echo "Build the file"
+            npm run build
+
+            # Start the backend
+            echo "Start the backend"
+            pm2 delete server || true
+            pm2 start ~/${REPO}/dist/server.js --name server
+
+            # Wait for server to start
+            echo "Waiting for server to start..."
+            sleep 5
+
+            # Check status
+            echo "Check status"
+            pm2 status
+
+            # Save PM2 process list
+            echo "Save PM2 process list"
+            pm2 save
+
+            # Start Frontend with PM2
+            cd ~/${REPO}/frontend
+            pm2 delete client || true
+            pm2 start npm --name "client" -- start
+            pm2 save
+            pm2 status
