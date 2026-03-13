@@ -1,134 +1,236 @@
-name: Deploy the Backend
+name: Deploy Backend to AWS EC2
+
 on:
   push:
     branches:
       - main
       - master
   workflow_dispatch:
+    inputs:
+      skip_health_check:
+        description: Skip health check
+        required: false
+        type: boolean
+        default: false
+
+env:
+  NODE_VERSION: lts/*
 
 jobs:
   deploy:
-    name: Deploy the Backend
+    name: Deploy Backend
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Prepare Server Environment
-        uses: appleboy/ssh-action@v1.0.3
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
         with:
-          host: ${{secrets.EC2_HOST}}
-          username: ${{secrets.EC2_USER}}
-          key: ${{secrets.EC2_SSH_KEY}}
-          script: |
+          ssh-private-key: ${{ secrets.EC2_SSH_KEY }}
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          cat >> ~/.ssh/config <<EOF
+          Host ${{ secrets.EC2_HOST }}
+            StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Test SSH Connection
+        run: |
+          ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "echo 'SSH connection successful'"
+
+      - name: Install Prerequisites
+        run: |
+          ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'ENDSSH'
             set -e
 
-            DB_USER=${{ secrets.DB_USER }}
-            DB_PASS=${{ secrets.DB_PASSWORD }}
-            DB_NAME=${{ secrets.DB_NAME }}
-            REPO=${{ secrets.REPO }}
-            BRANCH=${{ github.ref_name }}
+            REPO='${{ secrets.REPO }}'
             BOOTSTRAP_MARKER="$HOME/.${REPO}_bootstrap_done"
 
-            # Run bootstrap only once per server.
             if [ ! -f "$BOOTSTRAP_MARKER" ]; then
-              echo "First deployment detected. Running bootstrap setup..."
+              echo "First deployment bootstrap started"
 
-              # Update System Packages
               sudo apt update && sudo apt upgrade -y
 
-              # Install NVM
+              # System-wide fallback for non-NVM shells.
+              sudo apt install -y nodejs npm git curl
+
               if [ ! -d "$HOME/.nvm" ]; then
                 curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
               fi
 
               export NVM_DIR="$HOME/.nvm"
-              [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+              [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
 
-              # Install Node.js LTS and PM2
-              nvm install --lts
-              nvm use --lts
+              nvm install '${{ env.NODE_VERSION }}'
+              nvm use '${{ env.NODE_VERSION }}'
+              nvm alias default '${{ env.NODE_VERSION }}'
+
               npm install -g pm2
 
-              # Install PostgreSQL
-              sudo apt install -y postgresql postgresql-contrib
-              sudo systemctl start postgresql
-              sudo systemctl enable postgresql
-
-              # Create Database & User (idempotent)
-              sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'" | grep -q 1 || \
-              sudo -u postgres psql -c "CREATE USER \"${DB_USER}\" WITH PASSWORD '${DB_PASS}';"
-
-              sudo -u postgres psql -c "ALTER USER \"${DB_USER}\" CREATEDB;"
-
-              sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" | grep -q 1 || \
-              sudo -u postgres psql -c "CREATE DATABASE \"${DB_NAME}\" OWNER \"${DB_USER}\";"
-
               touch "$BOOTSTRAP_MARKER"
-              echo "Bootstrap completed."
+              echo "Bootstrap completed"
             else
-              echo "Bootstrap already completed. Skipping one-time setup."
+              echo "Bootstrap already completed"
             fi
 
             export NVM_DIR="$HOME/.nvm"
-            [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-            nvm use --lts
+            [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+            nvm use '${{ env.NODE_VERSION }}' || true
+
+            if ! command -v npm >/dev/null 2>&1; then
+              sudo apt update
+              sudo apt install -y nodejs npm
+            fi
+
+            if ! command -v pm2 >/dev/null 2>&1; then
+              npm install -g pm2
+            fi
 
             echo "Node: $(node -v)"
             echo "NPM: $(npm -v)"
+            echo "PM2: $(pm2 -v)"
+          ENDSSH
 
-            # Clone or Update Repository
-            echo "Clone or Update Repository"
-            if [ ! -d "$HOME/${REPO}" ]; then
-              cd ~
-              git clone --branch "$BRANCH" https://github.com/sunan-rabbi/${REPO}.git
+      - name: Setup PostgreSQL
+        run: |
+          ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'ENDSSH'
+            set -e
+
+            DB_USER='${{ secrets.DB_USER }}'
+            DB_PASS='${{ secrets.DB_PASSWORD }}'
+            DB_NAME='${{ secrets.DB_NAME }}'
+
+            if ! command -v psql >/dev/null 2>&1; then
+              sudo apt update
+              sudo apt install -y postgresql postgresql-contrib
+            fi
+
+            sudo systemctl enable postgresql
+            sudo systemctl start postgresql
+
+            sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'" | grep -q 1 || \
+            sudo -u postgres psql -c "CREATE USER \"${DB_USER}\" WITH PASSWORD '${DB_PASS}';"
+
+            sudo -u postgres psql -c "ALTER USER \"${DB_USER}\" CREATEDB;"
+
+            sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" | grep -q 1 || \
+            sudo -u postgres psql -c "CREATE DATABASE \"${DB_NAME}\" OWNER \"${DB_USER}\";"
+
+            sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE \"${DB_NAME}\" TO \"${DB_USER}\";"
+          ENDSSH
+
+      - name: Clone or Update Repository
+        run: |
+          ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'ENDSSH'
+            set -e
+
+            REPO='${{ secrets.REPO }}'
+            BRANCH='${{ github.ref_name }}'
+            DEPLOY_PATH="$HOME/${REPO}"
+
+            if [ ! -d "$DEPLOY_PATH/.git" ]; then
+              git clone --branch "$BRANCH" https://github.com/${{ github.repository }}.git "$DEPLOY_PATH"
             else
-              cd $HOME/${REPO}
+              cd "$DEPLOY_PATH"
               git fetch origin
               git checkout "$BRANCH"
               git pull --ff-only origin "$BRANCH"
             fi
-   
-            # Setup Backend
-            echo "Setup Backend"
-            cd ~/${REPO}
+          ENDSSH
+
+      - name: Install Backend Dependencies
+        run: |
+          ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'ENDSSH'
+            set -e
+
+            REPO='${{ secrets.REPO }}'
+            DEPLOY_PATH="$HOME/${REPO}"
+
+            export NVM_DIR="$HOME/.nvm"
+            [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+            nvm use '${{ env.NODE_VERSION }}' || true
+
+            cd "$DEPLOY_PATH"
             npm install
+          ENDSSH
 
-            # Create Production Environment File
-            echo "Environment File"
-            [ -f .env ] || cp .env.example .env
+      - name: Create Environment File
+        run: |
+          ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'ENDSSH'
+            set -e
 
-            # Setup Prisma
-            echo "Setup Prisma"
+            REPO='${{ secrets.REPO }}'
+            DEPLOY_PATH="$HOME/${REPO}"
+
+            cd "$DEPLOY_PATH"
+
+            cp .env.example .env
+          ENDSSH
+
+      - name: Prisma Setup and Build
+        run: |
+          ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'ENDSSH'
+            set -e
+
+            REPO='${{ secrets.REPO }}'
+            DEPLOY_PATH="$HOME/${REPO}"
+
+            export NVM_DIR="$HOME/.nvm"
+            [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+            nvm use '${{ env.NODE_VERSION }}' || true
+
+            cd "$DEPLOY_PATH"
+
             npm run genKey
-            npm run migrate
+            npx prisma migrate deploy
             npm run generate
-
-            # Build the File
-            echo "Build the file"
             npm run build
+          ENDSSH
 
-            # Start the backend
-            echo "Start the backend"
+      - name: Restart Backend Service
+        run: |
+          ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'ENDSSH'
+            set -e
+
+            REPO='${{ secrets.REPO }}'
+            DEPLOY_PATH="$HOME/${REPO}"
+
+            export NVM_DIR="$HOME/.nvm"
+            [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+            nvm use '${{ env.NODE_VERSION }}' || true
+
             pm2 delete server || true
-            pm2 start ~/${REPO}/dist/server.js --name server
+            pm2 start "$DEPLOY_PATH/dist/server.js" --name server
+            pm2 save
+            pm2 status
+          ENDSSH
 
-            # Wait for server to start
-            echo "Waiting for server to start..."
+      - name: Health Check
+        if: github.event.inputs.skip_health_check != 'true'
+        run: |
+          ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'ENDSSH'
+            set -e
+
+            REPO='${{ secrets.REPO }}'
+            DEPLOY_PATH="$HOME/${REPO}"
+
+            cd "$DEPLOY_PATH"
+            PORT="${{ secrets.PORT }}"
+            [ -n "$PORT" ] || PORT="5000"
+
             sleep 5
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:${PORT}/health" || true)
+            if [ "$CODE" != "200" ]; then
+              echo "Health check failed with HTTP ${CODE}"
+              pm2 logs server --lines 30 --nostream || true
+              exit 1
+            fi
 
-            # Check status
-            echo "Check status"
-            pm2 status
-
-            # Save PM2 process list
-            echo "Save PM2 process list"
-            pm2 save
-
-            # Start Frontend with PM2
-            cd ~/${REPO}/frontend
-            pm2 delete client || true
-            pm2 start npm --name "client" -- start
-            pm2 save
-            pm2 status
+            echo "Health check passed with HTTP ${CODE}"
+          ENDSSH
